@@ -1,6 +1,17 @@
-import { Context, Storage, ContractPromise, ContractPromiseResult, PersistentUnorderedMap, PersistentSet, u128, logging } from 'near-sdk-as';
 import { JSON } from 'assemblyscript-json';
 import { Buffer } from 'assemblyscript-json/util';
+import { ContractCall } from './model';
+import { 
+    Context, 
+    Storage, 
+    ContractPromise, 
+    ContractPromiseBatch, 
+    ContractPromiseResult, 
+    PersistentUnorderedMap, 
+    PersistentSet, 
+    logging,
+    u128
+} from 'near-sdk-as';
 
 // whitelist uses permission levels
 // "untrusted"  (default, contract is unsafe)
@@ -122,17 +133,29 @@ function _toOrdinaryString(strOrNull: JSON.Str | null): string {
 
 export function logCall(
     tags: string,
-    addr: string, 
-    func: string, 
-    args: string, 
-    gas: u64, 
-    depo: u128 = u128.Zero
+    batch: ContractCall[]
 ): void {
 
-    assert(getPermissionLevel(addr) == "trusted" 
-        || Storage.get<string>("trust") == "all", 
-        `Contract ${addr} is not trusted.`
-    );
+    // make sure batch is valid
+
+    assert(batch.length > 0, `Calls array cannot be empty.`);
+
+    let  totalDesposit: u128 = u128.Zero;
+    for (let i = 0; i < batch.length; i++) {
+
+        assert(batch[i].addr == batch[0].addr, `Cannot batch transactions with different target address.`);
+        assert(getPermissionLevel(batch[i].addr) == "trusted" 
+            || Storage.get<string>("trust") == "all", 
+            `Contract ${batch[i].addr} is not trusted.`
+        );
+
+        totalDesposit = u128.add(totalDesposit, batch[i].depo);
+
+    }
+
+    assert(u128.le(totalDesposit, Context.accountBalance), `Insufficient funds.`);
+
+    // make sure tags are valid & complete
 
     tagsJSON = <JSON.Obj>(JSON.parse(tags));
 
@@ -149,24 +172,56 @@ export function logCall(
     
     }
     
-    const promise = ContractPromise.create(
-        addr,
-        func,
-        Buffer.fromString(args),
-        gas,
-        depo
-    );
+    if (batch.length == 1) {
+    
+        const promise = ContractPromise.create(
+            batch[0].addr,
+            batch[0].func,
+            Buffer.fromString(batch[0].args),
+            batch[0].gas,
+            batch[0].depo
+        );
 
-    promise.then(
-        Context.contractName,
-        "_callback",
-        Buffer.fromString(`{
-            "addr":"${addr}",
-            "func":"${func}",
-            "tags":"${tags.replaceAll("\"", "\\\"")}"
-        }`),
-        50000000000000 // 50Tgas
-    );
+        promise.then(
+            Context.contractName,
+            "_callback",
+            Buffer.fromString(`{
+                "addr":"${batch[0].addr}",
+                "func":"${batch[0].func}",
+                "tags":"${tags.replaceAll("\"", "\\\"")}"
+            }`),
+            50000000000000 // 50Tgas
+        );
+
+    } else if (batch.length > 1) {
+
+        const promise = ContractPromiseBatch.create(batch[0].addr).function_call(
+            batch[0].func,
+            Buffer.fromString(batch[0].args),
+            batch[0].depo,
+            batch[0].gas
+        );
+
+        for (let i = 1; i < batch.length; i++)
+            promise.function_call(
+                batch[i].func,
+                Buffer.fromString(batch[i].args),
+                batch[i].depo,
+                batch[i].gas
+            );
+
+        promise.then(Context.contractName).function_call(
+            "_callback",
+            Buffer.fromString(`{
+                "addr":"${batch[0].addr}",
+                "func":"${batch[0].func}",
+                "tags":"${tags.replaceAll("\"", "\\\"")}"
+            }`),
+            u128.Zero,
+            50000000000000, // 50Tgas
+        );
+
+    }
 
 }
 
@@ -176,20 +231,32 @@ export function _callback(
     tags: string
 ): void {
 
-    const result: ContractPromiseResult = ContractPromise.getResults()[0];
+    const results: ContractPromiseResult[] = ContractPromise.getResults();
 
     tagsJSON = <JSON.Obj>(JSON.parse(tags));
     const tagsString: string = tagsJSON.keys
         .map<string>(t => `${t}: ${_toOrdinaryString(tagsJSON.getString(t))}`)
         .join(",\n\t");
 
-    // TODO what if result is JSON?
-    logging.log(`
-        Called method "${func}" of ${Storage.get<string>("trust") == "trusted" ? "trusted " : ""}contract "${addr}" and ${result.succeeded ? "succeeded" : ""}${result.pending ? "is still pending" : ""}${result.failed ? "failed" : ""}
-        Result: ${result.succeeded ? result.decode<string>() : "[Error]"}
-        Sender: ${Context.sender}
+    for (let i = 0; i < results.length; i++) {
 
-        ${tagsString}
-    `);
+        const state: string = `${results[i].succeeded ? "succeeded" : ""}${results[i].pending ? "is still pending" : ""}${results[i].failed ? "failed" : ""}`;
+        const trusted: string = Storage.get<string>("trust") == "trusted" 
+            ? "trusted " 
+            : "";
+        const method: string = results.length == 1 
+            ? "\"" + func + "\"" 
+            : "";
+        
+        // TODO what if result is JSON?
+        logging.log(`
+            Called method ${method} of ${trusted}contract "${addr}" and ${state}
+            Result: ${results[i].succeeded ? results[i].decode<string>() : "[Error]"}
+            Sender: ${Context.sender}
+
+            ${tagsString}\n\n
+        `);
+
+    }
 
 }
